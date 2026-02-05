@@ -2,14 +2,15 @@
 
 # ==============================================================================
 # Project : TunMan (Tunnel Manager)
-# Description : Per-Tunnel Configuration & Independent Management
-# Version : 1.0.0
+# Description : Tunnel Manager
+# Version : 1.1.0
 # ==============================================================================
 
 # --- Global Config ---
 INSTALL_PATH="/usr/local/bin/tunman"
 CONFIG_DIR="/etc/tunman"
 SERVICE_TEMPLATE="/etc/systemd/system/tunman@.service"
+REPO_URL="https://raw.githubusercontent.com/MrMstafa/tunman/main/tunman.sh"
 
 # --- IP Allocation Rules ---
 # UDP   -> 192.168.100.x
@@ -24,33 +25,89 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-# --- 1. System Checks & Installation ---
-
 check_root() {
     if [[ $EUID -ne 0 ]]; then
-        echo -e "${RED}Error : Run as root${NC}"
+        echo -e "${RED}Error : Please run as root (sudo)${NC}"
         exit 1
     fi
 }
 
-install_dependencies() {
-    if ! command -v ip &> /dev/null; then
-        apt-get update -y -q > /dev/null 2>&1
-        apt-get install -y -q iproute2 kmod > /dev/null 2>&1
+install_kernel_extras() {
+    echo -e "${YELLOW}[System] Kernel modules missing Attempting to install extras...${NC}"
+    KERNEL_VER=$(uname -r)
+    
+    if command -v apt-get &> /dev/null; then
+        apt-get update -y -q
+        if ! apt-get install -y -q "linux-modules-extra-$KERNEL_VER"; then
+            apt-get install -y -q linux-image-extra-virtual
+        fi
+        
+    elif command -v dnf &> /dev/null; then
+        dnf install -y kernel-modules-extra
+        
+    elif command -v yum &> /dev/null; then
+        yum install -y kernel-modules-extra
     fi
-    for mod in l2tp_core l2tp_netlink l2tp_eth vxlan; do
-        if ! grep -q "^$mod" /proc/modules; then modprobe $mod > /dev/null 2>&1; fi
+    
+    depmod -a
+}
+
+install_dependencies() {
+    if ! command -v ip &> /dev/null || ! command -v curl &> /dev/null; then
+        echo -e "${YELLOW}[Init] Installing dependencies...${NC}"
+        if command -v apt-get &> /dev/null; then
+            apt-get update -y -q > /dev/null 2>&1
+            apt-get install -y -q iproute2 kmod curl > /dev/null 2>&1
+        elif command -v dnf &> /dev/null; then
+            dnf install -y iproute kmod curl > /dev/null 2>&1
+        elif command -v yum &> /dev/null; then
+            yum install -y iproute kmod curl > /dev/null 2>&1
+        fi
+    fi
+
+    REQUIRED_MODS="l2tp_core l2tp_netlink l2tp_eth vxlan"
+    MISSING_MODS=0
+
+    for mod in $REQUIRED_MODS; do
+        if ! modprobe $mod > /dev/null 2>&1; then
+            MISSING_MODS=1
+        fi
+    done
+
+    if [[ $MISSING_MODS -eq 1 ]]; then
+        install_kernel_extras
+    fi
+
+    echo -e "${CYAN}[Init] Loading kernel modules...${NC}"
+    for mod in $REQUIRED_MODS; do
+        if ! modprobe $mod > /dev/null 2>&1; then
+            echo -e "${RED}Error : Failed to load module '$mod'.${NC}"
+            echo -e "${YELLOW}Hint : If you are on OpenVZ/LXC, this is not supported. Use KVM/VMware.${NC}"
+        fi
     done
 }
 
 self_install() {
-    if [[ "$0" != "$INSTALL_PATH" ]]; then
-        echo -e "${CYAN}[Install] Installing TunMan...${NC}"
+    if [[ "$0" == "$INSTALL_PATH" ]]; then
+        return
+    fi
+
+    echo -e "${CYAN}[Install] Installing TunMan to system path...${NC}"
+    mkdir -p "$CONFIG_DIR"
+
+    if [[ -f "$0" ]]; then
         cp "$0" "$INSTALL_PATH"
-        chmod +x "$INSTALL_PATH"
-        mkdir -p "$CONFIG_DIR"
-        
-        cat <<EOF > "$SERVICE_TEMPLATE"
+    else
+        echo -e "${YELLOW}Downloading latest version from GitHub...${NC}"
+        if ! curl -sL "$REPO_URL" -o "$INSTALL_PATH"; then
+             echo -e "${RED}Error : Download failed. Check internet connection.${NC}"
+             exit 1
+        fi
+    fi
+
+    chmod +x "$INSTALL_PATH"
+
+    cat <<EOF > "$SERVICE_TEMPLATE"
 [Unit]
 Description=TunMan Service [%i]
 After=network-online.target
@@ -65,11 +122,10 @@ RestartSec=5s
 [Install]
 WantedBy=multi-user.target
 EOF
-        systemctl daemon-reload
-        echo -e "${GREEN}[Success] Installed ! Run 'tunman' to start${NC}"
-        sleep 1
-        exec "$INSTALL_PATH"
-    fi
+    
+    systemctl daemon-reload
+    echo -e "${GREEN}[Success] Installed ! You can now run 'tunman' anywhere.${NC}"
+    sleep 1
 }
 
 run_service() {
@@ -85,10 +141,10 @@ run_service() {
 
     if [[ -z "$MTU" ]]; then
         case "$TYPE" in
-            "udp")   MTU=1420 ;; # Safe for UDP overhead
-            "ip")    MTU=1460 ;; # Low overhead (Raw IP)
-            "vxlan") MTU=1450 ;; # Standard VXLAN overhead
-            *)       MTU=1400 ;; # Generic fallback
+            "udp")   MTU=1420 ;;
+            "ip")    MTU=1460 ;;
+            "vxlan") MTU=1450 ;;
+            *)       MTU=1400 ;;
         esac
     fi
 
@@ -164,9 +220,9 @@ configure_tunnel() {
     echo "------------------------------------------------"
     
     case "$TYPE" in
-        "udp")   SUGGESTED_MTU=1420 ;; # Balanced for UDP overhead
-        "ip")    SUGGESTED_MTU=1460 ;; # Efficient for Raw IP
-        "vxlan") SUGGESTED_MTU=1450 ;; # Standard for VXLAN
+        "udp")   SUGGESTED_MTU=1420 ;; 
+        "ip")    SUGGESTED_MTU=1460 ;; 
+        "vxlan") SUGGESTED_MTU=1450 ;; 
     esac
 
     echo -e "Suggested MTU for $TYPE is ${GREEN}$SUGGESTED_MTU${NC}"
@@ -209,7 +265,7 @@ change_mtu() {
         fi
         echo -e "${GREEN}MTU updated to $NEW_MTU${NC}"
         
-        read -p "Restart tunnel to apply ? [y/N]: " RST
+        read -p "Restart tunnel to apply ? [y/N] : " RST
         if [[ "$RST" =~ ^[Yy]$ ]]; then systemctl restart "tunman@$TYPE"; fi
     fi
 }
@@ -276,18 +332,18 @@ manage_tunnel_menu() {
             1)
                 systemctl enable "tunman@$TYPE"
                 systemctl restart "tunman@$TYPE"
-                echo "Started."
+                echo "Started"
                 sleep 1
                 ;;
             2)
                 systemctl stop "tunman@$TYPE"
-                echo "Stopped."
+                echo "Stopped"
                 sleep 1
                 ;;
             3)
                 configure_tunnel "$TYPE"
                 echo -e "${YELLOW}Note : Restart tunnel to apply changes${NC}"
-                read -p "Restart now ? [y/N]: " RST
+                read -p "Restart now ? [y/N] : " RST
                 if [[ "$RST" =~ ^[Yy]$ ]]; then systemctl restart "tunman@$TYPE"; fi
                 ;;
             4)
